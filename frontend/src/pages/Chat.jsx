@@ -106,7 +106,17 @@ export default function Chat() {
     'Does this GR supersede any previous order?',
   ]
 
-  const relationColor = { supersedes: '#EF4444', amends: '#FACC15', refers_to: '#6FB3FF' }
+  // Single source of truth for relationship colours — drives both the badge
+  // on each edge and the legend at the bottom of the panel, so adding a key
+  // here is all that's needed for a new relationship type.
+  // Green reads as "still in force, just for longer", which is exactly what
+  // an extension is, as opposed to red = cancelled / yellow = modified.
+  const relationColor = {
+    supersedes: '#EF4444',
+    amends:     '#FACC15',
+    extends:    '#4ADE80',
+    refers_to:  '#6FB3FF',
+  }
 
   // Filter out the optimistic placeholder from display
   const displayMessages = messages.filter(
@@ -332,7 +342,12 @@ export default function Chat() {
               </div>
             ))}
           </div>
-          <div style={{ padding: '12px 16px', borderTop: '1px solid #2A2D3E', display: 'flex', gap: '12px' }}>
+          {/* flexWrap because four legend entries no longer fit the 320px
+              panel on one row — without it the last one clips off the edge */}
+          <div style={{
+            padding: '12px 16px', borderTop: '1px solid #2A2D3E',
+            display: 'flex', flexWrap: 'wrap', columnGap: '12px', rowGap: '6px',
+          }}>
             {Object.entries(relationColor).map(([type, color]) => (
               <div key={type} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: color }} />
