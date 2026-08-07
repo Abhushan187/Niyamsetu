@@ -103,6 +103,32 @@ export function ChatProvider({ children }) {
     ])
   }
 
+  // Overwrites the trailing assistant entry instead of pushing a new one.
+  // Chat.jsx appends an optimistic "..." placeholder alongside the user
+  // message, then calls this once the real answer lands. Calling
+  // appendMessages a second time instead would push a duplicate user turn
+  // and strand the placeholder in both messages and history.
+  const replaceLastAssistant = (assistantMsg) => {
+    setMessages(prev => {
+      const last = prev.length - 1
+      if (last < 0 || prev[last].role !== 'assistant') return prev
+      const next = [...prev]
+      next[last] = assistantMsg
+      return next
+    })
+
+    // history is the trimmed {role, content} view sent to the backend —
+    // keep it in step so the next request carries the real answer rather
+    // than the placeholder.
+    setHistory(prev => {
+      const last = prev.length - 1
+      if (last < 0 || prev[last].role !== 'assistant') return prev
+      const next = [...prev]
+      next[last] = { role: 'assistant', content: assistantMsg.content }
+      return next
+    })
+  }
+
   const updateSessionTitle = (sessionId, title) => {
     setSessions(prev => prev.map(s => s._id === sessionId ? { ...s, title } : s))
   }
@@ -113,7 +139,7 @@ export function ChatProvider({ children }) {
       sessionLoading, setMessages,
       loadSessions, createSession, loadSession,
       deleteSession, renameSession, pinSession,
-      appendMessages, updateSessionTitle,
+      appendMessages, replaceLastAssistant, updateSessionTitle,
       setActiveSessionId,
     }}>
       {children}

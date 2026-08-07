@@ -7,10 +7,14 @@ import { useChat } from '../context/ChatContext'
 import client from '../api/client'
 import CitationPill from '../components/CitationPill'
 
+// Optimistic assistant bubble shown between send and response. Named so the
+// send path and the display filter can never disagree on its exact text.
+const PLACEHOLDER = '...'
+
 export default function Chat() {
   const {
     messages, history, activeSessionId,
-    appendMessages, updateSessionTitle, createSession,
+    appendMessages, replaceLastAssistant, updateSessionTitle, createSession,
     setActiveSessionId,
   } = useChat()
 
@@ -59,8 +63,11 @@ export default function Chat() {
     setError('')
     setGraphPanel(false)
 
+    // Optimistic render: show the user's message immediately, with a
+    // placeholder assistant turn that replaceLastAssistant() overwrites
+    // in place once the response (or an error) arrives.
     const userMsg = { role: 'user', content: query }
-    appendMessages(userMsg, { role: 'assistant', content: '...' })
+    appendMessages(userMsg, { role: 'assistant', content: PLACEHOLDER })
 
     setLoading(true)
 
@@ -75,8 +82,10 @@ export default function Chat() {
         language:    language    || 'english',
       }
 
-      // Replace the placeholder "..." with real answer
-      appendMessages(userMsg, assistantMsg)
+      // Overwrite the placeholder in place. Calling appendMessages again
+      // here would push a second copy of userMsg and leave the "..."
+      // stranded in both the rendered list and the history sent upstream.
+      replaceLastAssistant(assistantMsg)
 
       // Save to MongoDB session
       try {
@@ -91,7 +100,12 @@ export default function Chat() {
       if (citations?.length) fetchGraphRelations(citations)
 
     } catch (err) {
-      setError(err.response?.data?.detail || 'Something went wrong.')
+      const detail = err.response?.data?.detail || 'Something went wrong.'
+      setError(detail)
+      // Resolve the placeholder on the failure path too — otherwise a "..."
+      // bubble stays on screen once loading clears, and the next request
+      // ships "..." upstream as if it were a real assistant turn.
+      replaceLastAssistant({ role: 'assistant', content: `⚠️ ${detail}` })
     } finally {
       setLoading(false)
     }
@@ -108,9 +122,13 @@ export default function Chat() {
 
   const relationColor = { supersedes: '#EF4444', amends: '#FACC15', refers_to: '#6FB3FF' }
 
-  // Filter out the optimistic placeholder from display
+  // Hide the optimistic placeholder while the request is in flight — the
+  // dedicated "Searching GR documents..." block below covers that state.
+  // This only ever matches the trailing entry, which is exactly where
+  // replaceLastAssistant() writes, so the placeholder is always either
+  // filtered out or already overwritten.
   const displayMessages = messages.filter(
-    (m, i) => !(m.role === 'assistant' && m.content === '...' && loading && i === messages.length - 1)
+    (m, i) => !(m.role === 'assistant' && m.content === PLACEHOLDER && loading && i === messages.length - 1)
   )
 
   return (
