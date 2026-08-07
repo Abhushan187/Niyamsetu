@@ -16,6 +16,7 @@
 
 import sys
 import os
+import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, BackgroundTasks
@@ -64,27 +65,56 @@ async def _run_embedding_job():
     frontend sees a permanently stuck progress bar and /start refuses
     to start a new job ("already running") forever, requiring a
     server restart to recover.
+
+    The try covers the ENTIRE body — including the initial glob — because
+    anything that escapes before the try would hang the job in exactly the
+    way this guard exists to prevent.
+
+    Step 1 runs on a worker thread so the event loop stays free and
+    GET /api/embed/status keeps answering while the job runs.
     """
     global _embed_state
 
-    _embed_state["running"]     = True
-    _embed_state["last_status"] = "running"
-    _embed_state["started_at"]  = str(datetime.now(timezone.utc))
-    _embed_state["progress"]    = 0
-
-    # Count total files for progress tracking
-    pdf_files = list(settings.GRDOCS_PATH.glob("*.pdf"))
-    _embed_state["total_files"] = len(pdf_files)
-
-    def on_progress(filename: str, current: int, total: int):
-        """Called by embed_all_pdfs() after each PDF is processed."""
-        _embed_state["current_file"] = filename
-        _embed_state["progress"]     = round((current / total) * 80)  # 0-80%
-        _embed_state["last_message"] = f"Embedding {filename} ({current}/{total})"
-
     try:
+        _embed_state["running"]     = True
+        _embed_state["last_status"] = "running"
+        _embed_state["started_at"]  = str(datetime.now(timezone.utc))
+        _embed_state["progress"]    = 0
+
+        # Count total files for progress tracking
+        pdf_files = list(settings.GRDOCS_PATH.glob("*.pdf"))
+        _embed_state["total_files"] = len(pdf_files)
+
+        def on_progress(filename: str, current: int, total: int):
+            """
+            Called by embed_all_pdfs() after each PDF is processed.
+
+            Runs on the worker thread, not the event loop. Each statement
+            is a single dict item assignment, which is atomic under the
+            GIL, so the /status poller can never observe a torn value.
+            """
+            _embed_state["current_file"] = filename
+            _embed_state["progress"]     = round((current / total) * 80)  # 0-80%
+            _embed_state["last_message"] = f"Embedding {filename} ({current}/{total})"
+
         # ── Step 1: Embed PDFs ────────────────────────────
-        result = await embed_all_pdfs(progress_callback=on_progress)
+        # embed_all_pdfs() is declared `async def` but contains no `await`:
+        # PDF loading, Tesseract OCR and FAISS.from_documents() are all
+        # fully synchronous and can run for minutes to hours. Awaiting it
+        # directly pins the event loop for that entire duration, so
+        # GET /api/embed/status — polled every 3s by the frontend — cannot
+        # respond, the progress bar freezes at 0%, and every other request
+        # to the API hangs behind it.
+        #
+        # Moving it to a worker thread keeps the loop free. Note it is a
+        # coroutine function, so calling it merely builds a coroutine
+        # object; asyncio.run() drives that coroutine to completion on the
+        # worker thread's own event loop. embed_all_pdfs' internals are
+        # unchanged — only the invocation moved.
+        def _embed_on_worker_thread():
+            return asyncio.run(embed_all_pdfs(progress_callback=on_progress))
+
+        result = await asyncio.to_thread(_embed_on_worker_thread)
 
         if not result["success"]:
             _embed_state["last_status"]  = "failed"
@@ -104,6 +134,13 @@ async def _run_embedding_job():
         _embed_state["last_message"] = "Building GR relationship graph..."
 
         # ── Step 3: Build GR graph ────────────────────────
+        # NOT moved to a worker thread: build_graph() awaits Motor
+        # (gr_graph.replace_one), and a Motor client is bound to the event
+        # loop that created it — driving it on a second loop in another
+        # thread would break. It does still block the loop while scanning
+        # PDFs, so /status can stall during this step. Fixing that means
+        # splitting build_graph() into a sync scan plus an async write,
+        # which is a change to its internals and out of scope here.
         graph_result = await build_graph()
 
         # ── Step 4: Mark complete ─────────────────────────
