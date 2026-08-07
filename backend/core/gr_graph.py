@@ -65,6 +65,28 @@ AMENDS_PATTERNS = [
     r"सुधारणा\s+करण्यात\s+येत",       # "modification is being made"
 ]
 
+EXTENDS_PATTERNS = [
+    # A GR that only pushes out a deadline — it neither cancels nor
+    # rewrites the earlier GR, so it is distinct from both "supersedes"
+    # and "amends". The prior GR stays fully in force, just for longer.
+
+    # English patterns
+    r"extension\s+of\s+time",
+    r"extended\s+(?:up\s*to|until|till)",
+    r"(?:validity|period|duration|deadline|time\s+limit)\s+(?:is\s+|has\s+been\s+)?(?:hereby\s+)?extended",
+    r"(?:hereby\s+)?extends?\s+the\s+(?:validity|period|duration|deadline|time\s+limit)",
+    r"grant(?:ed|ing)?\s+(?:an\s+)?extension",
+
+    # Marathi patterns
+    # \s* covers both the joined form मुदतवाढ and the spaced form मुदत वाढ.
+    # Being unanchored it also picks up the inflected मुदतवाढीस /
+    # मुदतवाढीचा and the verb form मुदत वाढविण्यात येत, so those need no
+    # separate entries.
+    r"मुदत\s*वाढ",                      # "extension of the deadline"
+    r"कालावधी\s+वाढव",                  # "the period is being extended"
+    r"पर्यंत\s+वाढविण्यात\s+येत",       # "extended up to <date>"
+]
+
 REFERS_PATTERNS = [
     # English patterns
     r"(?:with\s+)?reference\s+to\s+(?:GR|Government\s+Resolution|circular)",
@@ -118,8 +140,12 @@ def _detect_relationships(text: str, source_gr_id: str) -> list:
                     "snippet":     snippet[:300],
                 })
 
+    # Ordered most-specific to most-generic. refers_to stays last because
+    # a GR that supersedes/amends/extends another almost always also
+    # references it, so the stronger label should be found first.
     scan_patterns(SUPERSEDES_PATTERNS, "supersedes")
     scan_patterns(AMENDS_PATTERNS,     "amends")
+    scan_patterns(EXTENDS_PATTERNS,    "extends")
     scan_patterns(REFERS_PATTERNS,     "refers_to")
 
     return relationships

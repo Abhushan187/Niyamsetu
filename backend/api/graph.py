@@ -55,6 +55,7 @@ async def fetch_graph(
                 "total_edges": 3,
                 "supersedes_count": 2,
                 "amends_count": 1,
+                "extends_count": 1,
                 "refers_to_count": 0
             }
         }
@@ -68,6 +69,7 @@ async def fetch_graph(
         "total_edges":     len(edges),
         "supersedes_count": sum(1 for e in edges if e["relation"] == "supersedes"),
         "amends_count":     sum(1 for e in edges if e["relation"] == "amends"),
+        "extends_count":    sum(1 for e in edges if e["relation"] == "extends"),
         "refers_to_count":  sum(1 for e in edges if e["relation"] == "refers_to"),
         "unknown_targets":  sum(1 for e in edges if e.get("target") == "Unknown"),
     }
