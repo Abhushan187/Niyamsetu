@@ -29,6 +29,38 @@ from config import settings
 router = APIRouter(prefix="/api/summary", tags=["Summary"])
 
 
+def _safe_path(base: Path, filename: str) -> Path:
+    """
+    Resolves `filename` inside `base`, rejecting path traversal.
+
+    Two gates:
+      1. Path(filename).name strips any directory component, so a mismatch
+         means the input was not a bare filename. Note that FastAPI
+         percent-decodes path params AFTER routing, so a request for
+         "..%2F..%2F.env" arrives here already decoded as "../../.env"
+         and is caught here.
+      2. Even a name that passes gate 1 must still resolve to somewhere
+         inside `base` — covers symlinks and platform-specific quirks.
+
+    Raises:
+        HTTPException 400 if the filename is unsafe.
+    """
+    if not filename or Path(filename).name != filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
+    resolved = (base / filename).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
+    return resolved
+
+
 # ── Summary job state tracker ─────────────────────────────
 # Same pattern as embed.py — track background job state in memory
 _summary_state = {
@@ -133,8 +165,14 @@ async def generate_summary(
             "state":   _summary_state,
         }
 
-    # Validate the file exists
-    pdf_path = settings.GRDOCS_PATH / request.filename
+    # Validate the filename before touching the filesystem. Unlike the
+    # download route, this name arrives in a JSON body rather than a URL
+    # path param, so Starlette's [^/]+ converter never sees it and plain
+    # forward slashes pass straight through — "../../.env" would reach
+    # the .exists() check below as-is, turning it into an existence
+    # oracle for arbitrary paths (and, for any PDF-parseable file, a
+    # content disclosure once _run_summary_job summarizes it).
+    pdf_path = _safe_path(settings.GRDOCS_PATH, request.filename)
     if not pdf_path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -318,7 +356,10 @@ async def download_summary(
     Args:
         filename : the TXT filename e.g. "GR_2024_transfer_summary.txt"
     """
-    file_path = settings.SUMMARIES_PATH / filename
+    # Validate before touching the filesystem — `filename` comes straight
+    # from the URL. Without this, any logged-in user could read arbitrary
+    # files, including backend/.env and its JWT_SECRET.
+    file_path = _safe_path(settings.SUMMARIES_PATH, filename)
 
     if not file_path.exists():
         raise HTTPException(
