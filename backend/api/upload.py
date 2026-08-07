@@ -33,6 +33,38 @@ ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx"}
 MAX_FILE_SIZE_MB = 50
 
 
+def _safe_path(base: Path, filename: str) -> Path:
+    """
+    Resolves `filename` inside `base`, rejecting path traversal.
+
+    Two gates:
+      1. Path(filename).name strips any directory component, so a mismatch
+         means the input was not a bare filename. Note that FastAPI
+         percent-decodes path params AFTER routing, so a request for
+         "..%2F..%2Fconfig.py" arrives here already decoded as
+         "../../config.py" and is caught here.
+      2. Even a name that passes gate 1 must still resolve to somewhere
+         inside `base` — covers symlinks and platform-specific quirks.
+
+    Raises:
+        HTTPException 400 if the filename is unsafe.
+    """
+    if not filename or Path(filename).name != filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
+    resolved = (base / filename).resolve()
+    if not resolved.is_relative_to(base.resolve()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
+    return resolved
+
+
 @router.post("/")
 async def upload_gr_file(
     file: UploadFile = File(...),
@@ -52,8 +84,21 @@ async def upload_gr_file(
         4. Save metadata to MongoDB
         5. Return confirmation
     """
+    # ── Step 0: Sanitize the client-supplied filename ─────
+    # file.filename comes from the multipart Content-Disposition header
+    # and is fully attacker-controlled — "../../../evil.pdf" would
+    # otherwise be written outside GRDOCS_PATH. .name strips any
+    # directory component; everything below uses safe_name, never
+    # file.filename.
+    safe_name = Path(file.filename or "").name
+    if not safe_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid filename.",
+        )
+
     # ── Step 1: Validate extension ────────────────────────
-    suffix = Path(file.filename).suffix.lower()
+    suffix = Path(safe_name).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -74,16 +119,16 @@ async def upload_gr_file(
 
     # ── Step 3: Save to disk ──────────────────────────────
     settings.GRDOCS_PATH.mkdir(parents=True, exist_ok=True)
-    destination = settings.GRDOCS_PATH / file.filename
+    destination = _safe_path(settings.GRDOCS_PATH, safe_name)
 
     # If file already exists add timestamp suffix to avoid overwrite
     if destination.exists():
         ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-        stem      = Path(file.filename).stem
+        stem      = Path(safe_name).stem
         dest_name = f"{stem}_{ts}{suffix}"
-        destination = settings.GRDOCS_PATH / dest_name
+        destination = _safe_path(settings.GRDOCS_PATH, dest_name)
     else:
-        dest_name = file.filename
+        dest_name = safe_name
 
     with open(destination, "wb") as f:
         f.write(contents)
@@ -158,7 +203,9 @@ async def delete_uploaded_file(
     filename: str,
     admin: dict = Depends(get_admin_user),
 ):
-    file_path = settings.GRDOCS_PATH / filename
+    # Validate before unlink() — `filename` comes straight from the URL,
+    # so without this "..%2F..%2Fconfig.py" would delete arbitrary files.
+    file_path = _safe_path(settings.GRDOCS_PATH, filename)
 
     if file_path.exists():
         file_path.unlink()
@@ -169,7 +216,9 @@ async def delete_uploaded_file(
     # otherwise Summaries page keeps showing a summary for a GR that no longer exists
     base_name = Path(filename).stem
     for ext in ("_summary.json", "_summary.txt"):
-        summary_file = settings.SUMMARIES_PATH / f"{base_name}{ext}"
+        # Derived names are validated too: base_name comes from the same
+        # untrusted input, so it gets the same containment check.
+        summary_file = _safe_path(settings.SUMMARIES_PATH, f"{base_name}{ext}")
         if summary_file.exists():
             summary_file.unlink()
 
