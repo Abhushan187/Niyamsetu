@@ -165,8 +165,14 @@ async def generate_summary(
             "state":   _summary_state,
         }
 
-    # Validate the file exists
-    pdf_path = settings.GRDOCS_PATH / request.filename
+    # Validate the filename before touching the filesystem. Unlike the
+    # download route, this name arrives in a JSON body rather than a URL
+    # path param, so Starlette's [^/]+ converter never sees it and plain
+    # forward slashes pass straight through — "../../.env" would reach
+    # the .exists() check below as-is, turning it into an existence
+    # oracle for arbitrary paths (and, for any PDF-parseable file, a
+    # content disclosure once _run_summary_job summarizes it).
+    pdf_path = _safe_path(settings.GRDOCS_PATH, request.filename)
     if not pdf_path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
