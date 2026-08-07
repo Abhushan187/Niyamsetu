@@ -96,6 +96,7 @@ async def append_to_session(
     """Appends a user + assistant message pair to a session."""
     success = await append_message(
         session_id=session_id,
+        username=current_user["username"],
         user_msg=request.user_msg,
         assistant_msg=request.assistant_msg,
     )
