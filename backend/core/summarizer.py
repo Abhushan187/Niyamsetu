@@ -16,6 +16,8 @@
 import sys
 import os
 import json
+import asyncio
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -27,6 +29,7 @@ from langchain_core.output_parsers import StrOutputParser
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings
 from core.language import clean_text, truncate_for_context
+from core.trace import trace
 
 
 def get_llm() -> OllamaLLM:
@@ -40,31 +43,58 @@ def get_llm() -> OllamaLLM:
         model=settings.LLM_MODEL,
         base_url=settings.OLLAMA_BASE_URL,
         temperature=0.1,
+        # Same pinned context as the chat path (config.py: LLM_NUM_CTX).
+        # Sharing one context size matters here: Ollama keys the loaded
+        # llama-server on it, so a summary at a different size would evict
+        # and reload the model the chat path is already using.
+        num_ctx=settings.LLM_NUM_CTX,
+        keep_alive=settings.LLM_KEEP_ALIVE,
     )
 
 
-def _load_pdf_text(pdf_path: str) -> str:
+def _load_pdf_text(pdf_path: str, stage_label: str = "") -> str:
     """
     Loads all text from a PDF file.
     Cleans and truncates to fit within LLM context window.
 
     Args:
-        pdf_path : full path to the PDF file
+        pdf_path    : full path to the PDF file
+        stage_label : diagnostic only — names the caller ("metadata" /
+                      "summary") so the stage prints below can be told
+                      apart, since this runs twice per document.
 
     Returns:
         Cleaned text string, max 12000 characters
     """
     from core.ocr import load_pdf_with_ocr_fallback
+
+    # ── DIAGNOSTIC ────────────────────────────────────────
+    # Character counts at each transform, so a document that ends up
+    # producing an empty or truncated prompt can be traced to the exact
+    # stage that dropped the text. flush=True because uvicorn buffers
+    # stdout — without it these can appear after the HTTP access logs.
+    tag = f"[{Path(pdf_path).name}|{stage_label or 'unlabelled'}]"
+
     documents = load_pdf_with_ocr_fallback(pdf_path)
+    raw_chars = sum(len(doc.page_content) for doc in documents)
+    print(f"{tag} STAGE 1 pdf loaded      : {len(documents)} page(s), {raw_chars} chars", flush=True)
 
     # Join all pages into one text block
     full_text = "\n".join(doc.page_content for doc in documents)
+    print(f"{tag} STAGE 2 pages joined    : {len(full_text)} chars", flush=True)
 
     # Clean whitespace and normalize line breaks
     full_text = clean_text(full_text)
+    print(f"{tag} STAGE 3 after clean_text: {len(full_text)} chars", flush=True)
 
     # Truncate to fit LLM context window safely
     full_text = truncate_for_context(full_text, max_chars=12000)
+    print(f"{tag} STAGE 4 after truncate  : {len(full_text)} chars", flush=True)
+
+    preview = full_text[:120].replace("\n", " ")
+    print(f"{tag} STAGE 5 sent to llm     : {len(full_text)} chars | preview: {preview!r}", flush=True)
+    if not full_text.strip():
+        print(f"{tag} STAGE 5 WARNING: text is empty — the LLM will receive a blank document", flush=True)
 
     return full_text
 
@@ -88,7 +118,12 @@ async def extract_metadata(pdf_path: str) -> dict:
         dict of extracted metadata fields
         Falls back to {"raw_output": "..."} if JSON parsing fails
     """
-    full_text = _load_pdf_text(pdf_path)
+    # _load_pdf_text() is fully synchronous: PyPDFLoader, pdf2image and
+    # Tesseract OCR (core/ocr.py) all block, for seconds to minutes on a
+    # scanned document. Awaiting it on the event loop stalls every other
+    # request. Offloaded to a worker thread — the function itself, and the
+    # text it produces, are unchanged.
+    full_text = await asyncio.to_thread(_load_pdf_text, pdf_path, stage_label="metadata")
     llm       = get_llm()
     parser    = StrOutputParser()
 
@@ -111,8 +146,20 @@ Document:
 {text}
 """)
 
+    # chain.invoke() is the SYNCHRONOUS LangChain entrypoint — it drives
+    # OllamaLLM through ollama.Client (blocking httpx), so it pins the event
+    # loop for the whole generation. Same class of bug fixed in api/embed.py.
+    # Offloaded to a worker thread; the chain and prompt are unchanged.
     chain = metadata_prompt | llm | parser
-    raw   = chain.invoke({"text": full_text})
+    # Separates PDF load/OCR (the STAGE lines above) from generation. If the
+    # terminal stops after STAGE 5 the document is still being read; if it
+    # stops here, Ollama is generating.
+    trace(
+        "LLM      start  metadata",
+        f"{Path(pdf_path).name} model={settings.LLM_MODEL} text={len(full_text)} chars",
+    )
+    raw   = await asyncio.to_thread(chain.invoke, {"text": full_text})
+    trace("LLM      done   metadata", f"{Path(pdf_path).name} {len(raw)} chars returned")
 
     # Try to parse as JSON
     # LLMs sometimes add extra text before/after — we strip it
@@ -148,7 +195,8 @@ async def generate_summary(pdf_path: str) -> str:
     Returns:
         Summary as a formatted text string
     """
-    full_text = _load_pdf_text(pdf_path)
+    # Synchronous PDF load + OCR — see extract_metadata() above.
+    full_text = await asyncio.to_thread(_load_pdf_text, pdf_path, stage_label="summary")
     llm       = get_llm()
     parser    = StrOutputParser()
 
@@ -183,8 +231,15 @@ Document:
 {text}
 """)
 
+    # Synchronous blocking LLM call — see extract_metadata() above.
     chain   = summary_prompt | llm | parser
-    summary = chain.invoke({"text": full_text})
+    # Second generation of the pair — see extract_metadata() above.
+    trace(
+        "LLM      start  summary",
+        f"{Path(pdf_path).name} model={settings.LLM_MODEL} text={len(full_text)} chars",
+    )
+    summary = await asyncio.to_thread(chain.invoke, {"text": full_text})
+    trace("LLM      done   summary", f"{Path(pdf_path).name} {len(summary)} chars returned")
     return summary.strip()
 
 
@@ -274,9 +329,21 @@ async def process_gr(pdf_path: str, progress_callback=None) -> dict:
         }
 
     except Exception as e:
+        # DIAGNOSTIC — this except is where the traceback used to die.
+        # Callers only ever saw str(e), which loses the exception type and
+        # the frame it came from. Print the full trace before collapsing it
+        # into the return dict.
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"process_gr FAILED for {pdf_path.name}", flush=True)
+        print(f"  {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        print(f"{'=' * 60}\n", flush=True)
+
         return {
             "success": False,
-            "message": f"Summary generation failed: {str(e)}",
+            # Include the exception type — "" from a bare str(e) is a common
+            # and completely unreadable failure message.
+            "message": f"Summary generation failed: {type(e).__name__}: {e}",
             "metadata": {},
             "summary": "",
         }

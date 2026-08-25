@@ -30,6 +30,35 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "nomic-embed-text"
     # Model used to generate answers (the actual LLM)
     LLM_MODEL: str = "phi4-mini"
+    # Hard ceiling on a single LLM call, in seconds.
+    # Without this the Ollama client defaults to timeout=None — an unbounded
+    # wait. A client that gave up long ago leaves the generation running, and
+    # because Ollama serialises on the model, that orphan blocks every later
+    # request until it finishes on its own.
+    # Set just above the harness's 600s per-question timeout so the caller
+    # still governs normal runs and this only fires as a backstop.
+    LLM_TIMEOUT: float = 620.0
+    # Context window pinned explicitly, in tokens.
+    # Left unset, Ollama sizes the context PER REQUEST from the prompt length
+    # and restarts llama-server whenever the tier changes (observed: -c 512,
+    # -c 2048, -c 4096 for the same model). That restart is a fresh CPU
+    # allocation of the weights (~2.3 GiB, mmap is off on the CPU path) plus
+    # the KV cache, and on a loaded machine it fails outright:
+    #   ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer
+    #   graph_reserve: failed to allocate compute buffers      -> HTTP 500
+    # Pinning removes the resize, so the model loads once and stays put.
+    # 8192 (not 4096) because the chat path never truncates: TOP_K=15 chunks
+    # of CHUNK_SIZE=800 plus source headers and CONTEXT_WINDOW=6 history turns
+    # reach ~16k characters, which is denser than 4096 tokens in Devanagari.
+    # Ollama runs with --context-shift, so a prompt that overflows a pinned
+    # context is NOT an error — it silently drops the front of the prompt,
+    # i.e. retrieved chunks, while citations still reference them.
+    LLM_NUM_CTX: int = 8192
+    # How long Ollama keeps the model resident after a request.
+    # Ollama's default is 5m, so any normal pause between questions unloads
+    # the model and the next question pays a full reload — another chance to
+    # hit the allocation failure above. 30m spans idle gaps in a chat session.
+    LLM_KEEP_ALIVE: str = "30m"
 
     # ── RAG settings ──────────────────────────────────────
     # How many characters per chunk when splitting PDFs
@@ -37,7 +66,7 @@ class Settings(BaseSettings):
     # How many characters overlap between chunks (prevents cutting mid-sentence)
     CHUNK_OVERLAP: int = 150
     # How many chunks to retrieve per query
-    TOP_K: int = 4
+    TOP_K: int = 12
     # How many previous chat turns to include for context
     CONTEXT_WINDOW: int = 6
 

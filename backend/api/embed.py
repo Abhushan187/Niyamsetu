@@ -19,7 +19,10 @@ import os
 import asyncio
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, BackgroundTasks
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, status
+from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth.router import get_admin_user
@@ -29,6 +32,18 @@ from db.gr_meta import get_all_gr_metadata, mark_as_embedded
 from config import settings
 
 router = APIRouter(prefix="/api/embed", tags=["Embedding"])
+
+
+class EmbedRequest(BaseModel):
+    """
+    Optional body for POST /start.
+
+    filenames=None (or no body at all) keeps the original behaviour:
+    embed every PDF in grdocs/ and rebuild the index from scratch. A list
+    scopes the run to those documents and merges them into the existing
+    index instead.
+    """
+    filenames: list[str] | None = None
 
 # ── Embedding state tracker ───────────────────────────────
 # Stored in memory — tracks whether embedding is currently running.
@@ -49,13 +64,19 @@ _embed_state = {
 }
 
 
-async def _run_embedding_job():
+async def _run_embedding_job(filenames: list = None):
     """
     The actual embedding job — runs in background.
     Updates _embed_state as it progresses so frontend can poll status.
 
+    Args:
+        filenames : optional list of PDFs to embed. None means all of them.
+                    When given, embed_all_pdfs() merges into the existing
+                    index rather than rebuilding it, so the documents that
+                    were not selected keep their vectors.
+
     Steps:
-        1. Embed all PDFs into FAISS
+        1. Embed the selected PDFs into FAISS
         2. Mark each PDF as embedded in MongoDB
         3. Build GR relationship graph
         4. Update final state
@@ -81,8 +102,15 @@ async def _run_embedding_job():
         _embed_state["started_at"]  = str(datetime.now(timezone.utc))
         _embed_state["progress"]    = 0
 
-        # Count total files for progress tracking
-        pdf_files = list(settings.GRDOCS_PATH.glob("*.pdf"))
+        # Count total files for progress tracking.
+        # Step 2 below marks these as embedded, so this list must be the
+        # files the job actually processed — not every PDF on disk. A
+        # scoped run that marked the whole folder embedded would flag
+        # documents that were never touched.
+        if filenames is None:
+            pdf_files = list(settings.GRDOCS_PATH.glob("*.pdf"))
+        else:
+            pdf_files = [settings.GRDOCS_PATH / name for name in filenames]
         _embed_state["total_files"] = len(pdf_files)
 
         def on_progress(filename: str, current: int, total: int):
@@ -95,7 +123,13 @@ async def _run_embedding_job():
             """
             _embed_state["current_file"] = filename
             _embed_state["progress"]     = round((current / total) * 80)  # 0-80%
-            _embed_state["last_message"] = f"Embedding {filename} ({current}/{total})"
+            # NOTE: this callback fires only while PDFs are being LOADED.
+            # It is never called during the embed call itself, so progress
+            # necessarily parks at 80% / "N/N" for the whole embedding
+            # phase. A frozen bar there is expected and says nothing about
+            # whether Ollama is working — watch the EMBED START/heartbeat/
+            # EMBED DONE lines in the server terminal instead.
+            _embed_state["last_message"] = f"Loading {filename} ({current}/{total})"
 
         # ── Step 1: Embed PDFs ────────────────────────────
         # embed_all_pdfs() is declared `async def` but contains no `await`:
@@ -112,7 +146,10 @@ async def _run_embedding_job():
         # worker thread's own event loop. embed_all_pdfs' internals are
         # unchanged — only the invocation moved.
         def _embed_on_worker_thread():
-            return asyncio.run(embed_all_pdfs(progress_callback=on_progress))
+            return asyncio.run(embed_all_pdfs(
+                progress_callback=on_progress,
+                filenames=filenames,
+            ))
 
         result = await asyncio.to_thread(_embed_on_worker_thread)
 
@@ -141,6 +178,10 @@ async def _run_embedding_job():
         # PDFs, so /status can stall during this step. Fixing that means
         # splitting build_graph() into a sync scan plus an async write,
         # which is a change to its internals and out of scope here.
+        # Always rebuilds from every PDF on disk, including after a scoped
+        # embed. That is correct and intentional: relationships are edges
+        # BETWEEN documents, so a GR that was not re-embedded can still gain
+        # or lose an edge because a selected one changed.
         graph_result = await build_graph()
 
         # ── Step 4: Mark complete ─────────────────────────
@@ -169,12 +210,18 @@ async def _run_embedding_job():
 @router.post("/start")
 async def start_embedding(
     background_tasks: BackgroundTasks,
+    request: EmbedRequest | None = None,
     admin: dict = Depends(get_admin_user),
 ):
     """
     Starts the embedding pipeline in the background.
     Returns immediately — frontend polls /status for progress.
     Admin only.
+
+    Body is optional. With no body (or filenames=null) this embeds every
+    PDF and rebuilds the index — the original, unchanged behaviour. With
+    a filenames list it embeds only those and merges them into the
+    existing index.
 
     If embedding is already running, returns current status
     without starting a new job.
@@ -189,20 +236,54 @@ async def start_embedding(
             "state":   _embed_state,
         }
 
-    # Check there are PDFs to embed
-    pdf_files = list(settings.GRDOCS_PATH.glob("*.pdf"))
-    if not pdf_files:
-        return {
-            "success": False,
-            "message": "No PDF files found. Upload some GR documents first.",
-            "state":   _embed_state,
-        }
+    selected = request.filenames if request else None
+
+    if selected is not None:
+        if not selected:
+            return {
+                "success": False,
+                "message": "No documents selected to embed.",
+                "state":   _embed_state,
+            }
+
+        # Validate every name before starting. The job runs in the
+        # background, so a bad name caught later would surface only as a
+        # failed status the caller has to poll for.
+        missing = []
+        for name in selected:
+            if not name or Path(name).name != name:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid filename: {name!r}",
+                )
+            if not (settings.GRDOCS_PATH / name).exists():
+                missing.append(name)
+
+        if missing:
+            return {
+                "success": False,
+                "message": f"Not found in grdocs folder: {', '.join(missing)}",
+                "state":   _embed_state,
+            }
+
+        pdf_files = selected
+        scope_note = f"{len(selected)} selected PDF(s)"
+    else:
+        # Check there are PDFs to embed
+        pdf_files = [f.name for f in settings.GRDOCS_PATH.glob("*.pdf")]
+        if not pdf_files:
+            return {
+                "success": False,
+                "message": "No PDF files found. Upload some GR documents first.",
+                "state":   _embed_state,
+            }
+        scope_note = f"{len(pdf_files)} PDF(s)"
 
     # Reset state for new run
     _embed_state.update({
         "running":      True,
         "last_status":  "running",
-        "last_message": "Starting embedding pipeline...",
+        "last_message": f"Starting embedding pipeline for {scope_note}...",
         "total_chunks": 0,
         "current_file": "",
         "progress":     0,
@@ -210,11 +291,11 @@ async def start_embedding(
     })
 
     # Add to background tasks — runs after this function returns
-    background_tasks.add_task(_run_embedding_job)
+    background_tasks.add_task(_run_embedding_job, selected)
 
     return {
         "success": True,
-        "message": f"Embedding started for {len(pdf_files)} PDF(s). Poll /api/embed/status for progress.",
+        "message": f"Embedding started for {scope_note}. Poll /api/embed/status for progress.",
         "state":   _embed_state,
     }
 

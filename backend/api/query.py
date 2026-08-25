@@ -13,6 +13,7 @@
 
 import sys
 import os
+import asyncio
 from typing import Optional
 
 import httpx
@@ -22,6 +23,7 @@ from pydantic import BaseModel
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth.router import get_current_user
 from core.rag import query as rag_query
+from core.trace import trace
 from core.vectorstore import cosine_search_with_scores, is_ready
 from db.logs import save_query_log
 from config import settings
@@ -79,6 +81,17 @@ async def chat(
     Protected — requires valid JWT token.
     Any logged-in user can query (not admin-only).
     """
+    # ── Arrival trace ─────────────────────────────────────
+    # First thing in the handler, before any work: uvicorn's access log
+    # only prints once the response is sent, so without this the terminal
+    # shows nothing at all while a slow query is in flight.
+    trace(
+        "REQUEST  POST /api/query/chat",
+        f"user={current_user['username']} "
+        f"history={len(request.history)} turn(s) "
+        f"query={request.query[:80]!r}",
+    )
+
     # Convert Pydantic ChatMessage objects to plain dicts
     # rag.query() expects list of {"role": ..., "content": ...}
     history_dicts = [
@@ -137,8 +150,13 @@ async def similarity_search(
             detail="Vector store not ready. Ask admin to embed documents first.",
         )
 
-    # Get results with similarity scores
-    results_with_scores = cosine_search_with_scores(
+    # Get results with similarity scores.
+    # cosine_search_with_scores() is synchronous — it embeds the query via a
+    # blocking Ollama HTTP call (and loads the FAISS index from disk on the
+    # first call), which pins the event loop and stalls every other request.
+    # Same offload as core/rag.py:194; search behaviour is unchanged.
+    results_with_scores = await asyncio.to_thread(
+        cosine_search_with_scores,
         query=request.query,
         top_k=request.top_k,
     )

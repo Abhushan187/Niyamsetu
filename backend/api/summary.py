@@ -14,6 +14,7 @@
 
 import sys
 import os
+import traceback
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
@@ -23,6 +24,7 @@ from pydantic import BaseModel
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth.router import get_admin_user, get_current_user
 from core.summarizer import process_gr, list_summaries
+from core.trace import trace
 from db.gr_meta import get_all_gr_metadata
 from config import settings
 
@@ -78,6 +80,19 @@ class GenerateRequest(BaseModel):
     filename: str   # e.g. "GR_2024_transfer.pdf"
 
 
+class BatchRequest(BaseModel):
+    """
+    Optional body for POST /generate-batch.
+
+    filenames=None (or no body at all) keeps the original behaviour:
+    summarize every embedded document that has no summary yet. A list
+    scopes the run to exactly those documents, including ones that already
+    have a summary — selecting a document is an explicit instruction to
+    (re)summarize it, so it is not filtered against the pending list.
+    """
+    filenames: list[str] | None = None
+
+
 # ── Batch summary job state tracker ───────────────────────
 # Same in-memory pattern as _summary_state and embed.py's _embed_state.
 _batch_state = {
@@ -88,7 +103,8 @@ _batch_state = {
     "total_files":   0,
     "completed":     0,           # exact count done so far — used for "X/Y" UI
     "current_file":  "",
-    "failed_files":  [],
+    "failed_files":  [],       # list[str] — filenames only, kept for existing consumers
+    "failures":      [],       # list[{filename, error}] — per-document reason
 }
 
 
@@ -156,6 +172,14 @@ async def generate_summary(
     Result is stored in _summary_state["result"] when done.
     """
     global _summary_state
+
+    # ── Arrival trace ─────────────────────────────────────
+    # Before the running-check and the filesystem probe, so even a rejected
+    # request is visible the instant it lands.
+    trace(
+        "REQUEST  POST /api/summary/generate",
+        f"admin={admin['username']} file={request.filename!r}",
+    )
 
     # Don't start if already running
     if _summary_state["running"]:
@@ -244,6 +268,7 @@ async def _run_batch_summary_job(filenames: list):
     _batch_state["total_files"]  = len(filenames)
     _batch_state["completed"]    = 0
     _batch_state["failed_files"] = []
+    _batch_state["failures"]     = []
     _batch_state["progress"]     = 0
 
     for i, filename in enumerate(filenames, 1):
@@ -251,12 +276,25 @@ async def _run_batch_summary_job(filenames: list):
         _batch_state["last_message"] = f"Summarizing {filename} ({i}/{len(filenames)})"
 
         pdf_path = settings.GRDOCS_PATH / filename
+        print(f"\n─── batch {i}/{len(filenames)}: {filename} ───", flush=True)
+
         try:
             result = await process_gr(str(pdf_path))
             if not result["success"]:
+                # process_gr caught the exception itself and collapsed it
+                # into a message — this, not the except below, is the normal
+                # failure path. The message used to be dropped on the floor.
+                reason = result.get("message", "process_gr returned success=False with no message")
+                print(f"❌ FAILED (handled): {filename}\n   {reason}", flush=True)
                 _batch_state["failed_files"].append(filename)
-        except Exception:
+                _batch_state["failures"].append({"filename": filename, "error": reason})
+        except Exception as e:
+            # Anything process_gr did not catch — traceback is still live here.
+            reason = f"{type(e).__name__}: {e}"
+            print(f"❌ FAILED (uncaught): {filename}\n   {reason}", flush=True)
+            traceback.print_exc()
             _batch_state["failed_files"].append(filename)
+            _batch_state["failures"].append({"filename": filename, "error": reason})
 
         _batch_state["completed"] = i
         _batch_state["progress"]  = round((i / len(filenames)) * 100)
@@ -273,15 +311,29 @@ async def _run_batch_summary_job(filenames: list):
 @router.post("/generate-batch")
 async def generate_batch_summaries(
     background_tasks: BackgroundTasks,
+    request: BatchRequest | None = None,
     admin: dict = Depends(get_admin_user),
 ):
     """
-    Starts summary generation for ALL embedded-but-unsummarized GRs.
-    Admin only. Triggered by the "Summarize Pending" button.
+    Starts batch summary generation.
+    Admin only. Triggered by the "Summarize All" / "Summarize Selected" button.
+
+    Body is optional. With no body this summarizes every embedded GR that
+    has no summary yet — the original, unchanged behaviour. With a
+    filenames list it summarizes exactly those documents.
 
     Returns immediately — frontend polls /batch-status for progress.
     """
     global _batch_state
+
+    selected = request.filenames if request else None
+
+    # ── Arrival trace ─────────────────────────────────────
+    trace(
+        "REQUEST  POST /api/summary/generate-batch",
+        f"admin={admin['username']} scope="
+        f"{'all pending' if selected is None else f'{len(selected)} selected'}",
+    )
 
     if _batch_state["running"]:
         return {
@@ -290,29 +342,56 @@ async def generate_batch_summaries(
             "state":   _batch_state,
         }
 
-    pending = await get_pending_summary_files()
-    if not pending:
-        return {
-            "success": False,
-            "message": "No documents need summarizing.",
-            "state":   _batch_state,
-        }
+    if selected is not None:
+        if not selected:
+            return {
+                "success": False,
+                "message": "No documents selected to summarize.",
+                "state":   _batch_state,
+            }
+
+        # Validate every name before the job starts. _run_batch_summary_job
+        # builds paths from these directly, and it runs in the background
+        # where a rejection would only ever surface via polling.
+        missing = []
+        for name in selected:
+            path = _safe_path(settings.GRDOCS_PATH, name)
+            if not path.exists():
+                missing.append(name)
+
+        if missing:
+            return {
+                "success": False,
+                "message": f"Not found in grdocs folder: {', '.join(missing)}",
+                "state":   _batch_state,
+            }
+
+        targets = selected
+    else:
+        targets = await get_pending_summary_files()
+        if not targets:
+            return {
+                "success": False,
+                "message": "No documents need summarizing.",
+                "state":   _batch_state,
+            }
 
     _batch_state.update({
         "running":      True,
         "last_status":  "running",
-        "last_message": f"Starting batch summary for {len(pending)} document(s)...",
+        "last_message": f"Starting batch summary for {len(targets)} document(s)...",
         "progress":     0,
-        "total_files":  len(pending),
+        "total_files":  len(targets),
         "current_file": "",
         "failed_files": [],
+        "failures":     [],
     })
 
-    background_tasks.add_task(_run_batch_summary_job, pending)
+    background_tasks.add_task(_run_batch_summary_job, targets)
 
     return {
         "success": True,
-        "message": f"Batch summarization started for {len(pending)} document(s).",
+        "message": f"Batch summarization started for {len(targets)} document(s).",
         "state":   _batch_state,
     }
 
