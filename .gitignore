@@ -83,4 +83,5 @@ Thumbs.db
 
 # Generated HTML report from test runner
 tests/GR_Test_Report.html
-tests/*_results.json
+backend/tests/*_results.json
+backend/gr_structure_scan.csv
