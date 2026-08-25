@@ -285,6 +285,90 @@ async def get_graph() -> dict:
     }
 
 
+async def remove_from_graph(filenames: list) -> dict:
+    """
+    Removes deleted GRs from the stored relationship graph.
+
+    build_graph() rewrites the whole graph from whatever PDFs are on disk,
+    so it would eventually drop these on its own. That is not good enough
+    here: the graph is read by api/graph.py on every citation click, and
+    between a delete and the next embed it would keep offering nodes for
+    documents that no longer exist and edges that resolve to nothing.
+
+    Two different removals are needed, because a GR appears in the graph in
+    two roles:
+
+      - as a NODE, and as the SOURCE of edges it declared. Both describe a
+        document that is gone, so both are dropped outright.
+
+      - as the TARGET of some *other* GR's edge. That edge belongs to a
+        document that still exists and still genuinely says "supersedes
+        ...". Deleting it would erase a real statement from a surviving
+        document. Instead the target is reset to "Unknown", which is the
+        same value build_graph() assigns when it cannot resolve a hint —
+        so the edge stays visible and honest, just unresolved.
+
+    Args:
+        filenames : bare PDF filenames being deleted, e.g. ["GR1.3.pdf"]
+
+    Returns:
+        dict with success, nodes_removed, edges_removed, edges_unlinked
+    """
+    database = get_db()
+    graph    = await database.gr_graph.find_one({"_id": "main_graph"})
+
+    if not graph:
+        return {
+            "success":        True,
+            "nodes_removed":  0,
+            "edges_removed":  0,
+            "edges_unlinked": 0,
+            "message":        "No graph stored — nothing to remove.",
+        }
+
+    targets = set(filenames)
+    # Nodes are keyed by filename stem, edges reference that same stem.
+    stems   = {Path(name).stem for name in targets}
+
+    old_nodes = graph.get("nodes", [])
+    old_edges = graph.get("edges", [])
+
+    # Match on filename where the node carries one, falling back to the id,
+    # so nodes written before "filename" existed are still cleaned up.
+    nodes = [
+        n for n in old_nodes
+        if n.get("filename") not in targets and n.get("id") not in stems
+    ]
+
+    edges          = [e for e in old_edges if e.get("source") not in stems]
+    edges_unlinked = 0
+    for edge in edges:
+        if edge.get("target") in stems:
+            edge["target"] = "Unknown"
+            edges_unlinked += 1
+
+    await database.gr_graph.update_one(
+        {"_id": "main_graph"},
+        {"$set": {
+            "nodes":     nodes,
+            "edges":     edges,
+            "pdf_count": len(nodes),
+        }},
+    )
+
+    result = {
+        "success":        True,
+        "nodes_removed":  len(old_nodes) - len(nodes),
+        "edges_removed":  len(old_edges) - len(edges),
+        "edges_unlinked": edges_unlinked,
+    }
+    result["message"] = (
+        f"Graph: removed {result['nodes_removed']} node(s) and "
+        f"{result['edges_removed']} edge(s), unlinked {edges_unlinked} incoming edge(s)."
+    )
+    return result
+
+
 async def get_relationships_for_gr(gr_id: str) -> list:
     """
     Returns all edges where this GR is source or target.

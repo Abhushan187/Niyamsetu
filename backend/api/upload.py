@@ -3,9 +3,15 @@
 # GR Document Upload endpoints.
 #
 # Endpoints:
-#   POST /api/upload        → upload a GR PDF file (admin only)
-#   GET  /api/upload/list   → list all uploaded GR files
-#   DELETE /api/upload/{filename} → delete a GR file (admin only)
+#   POST /api/upload            → upload a GR PDF file (admin only)
+#   GET  /api/upload/list       → list all uploaded GR files
+#   GET  /api/upload/integrity  → report orphaned/partial state (admin only)
+#   POST /api/upload/delete     → delete several GR files (admin only)
+#   DELETE /api/upload/{filename} → delete one GR file (admin only)
+#
+# Both delete routes go through core/purge.py, which removes the PDF, its
+# FAISS chunks, its Mongo record, its summary and its graph entries as one
+# ordered operation and then verifies nothing was left behind.
 #
 # Files are saved to backend/data/grdocs/
 # Metadata is saved to MongoDB gr_metadata collection
@@ -19,11 +25,18 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from auth.router import get_admin_user, get_current_user
 from db.gr_meta import save_gr_metadata, get_all_gr_metadata, delete_gr_metadata, get_gr_stats
+from core.purge import purge_documents, check_integrity
 from config import settings
+
+
+class DeleteRequest(BaseModel):
+    """Body of POST /api/upload/delete — the selected documents."""
+    filenames: list[str]
 
 router = APIRouter(prefix="/api/upload", tags=["Upload"])
 
@@ -198,31 +211,71 @@ async def get_upload_stats(
     return {"success": True, **stats}
 
 
+@router.get("/integrity")
+async def get_integrity_report(
+    admin: dict = Depends(get_admin_user),
+):
+    """
+    Cross-checks disk, the FAISS index and MongoDB, and reports every
+    disagreement between them. Read-only — it changes nothing.
+
+    This is what makes a partial-deletion state visible instead of silent.
+    The category that matters most is orphaned_chunks: vectors whose PDF is
+    gone are still retrievable and will still be cited, with nothing in the
+    UI to say the source no longer exists.
+
+    Admin only.
+    """
+    report = await check_integrity()
+    return {"success": True, **report}
+
+
+@router.post("/delete")
+async def delete_selected_files(
+    request: DeleteRequest,
+    admin: dict = Depends(get_admin_user),
+):
+    """
+    Deletes several GR documents and every trace of them.
+    Admin only. Used by the Knowledge Base checkbox selection.
+
+    Runs as ONE purge rather than a loop of single deletes, so the FAISS
+    index is loaded, edited and written exactly once no matter how many
+    documents are selected. A loop would rewrite the index N times and give
+    N separate chances to fail partway through the batch.
+    """
+    if not request.filenames:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No documents selected.",
+        )
+
+    # Reject unsafe names up front, with the same gate the single-file
+    # route uses, so a bad name never reaches the filesystem.
+    for name in request.filenames:
+        _safe_path(settings.GRDOCS_PATH, name)
+
+    result = await purge_documents(request.filenames)
+    return result
+
+
 @router.delete("/{filename}")
 async def delete_uploaded_file(
     filename: str,
     admin: dict = Depends(get_admin_user),
 ):
-    # Validate before unlink() — `filename` comes straight from the URL,
+    """
+    Deletes one GR document and every trace of it.
+    Admin only.
+
+    Removes, in this order: FAISS chunks, the embedded flag, graph entries,
+    summary files, the Mongo record, then the PDF. The order is what
+    guarantees a crash cannot leave vectors behind for a file that is gone —
+    see core/purge.py for why that direction and not the other.
+    """
+    # Validate before anything else — `filename` comes straight from the URL,
     # so without this "..%2F..%2Fconfig.py" would delete arbitrary files.
-    file_path = _safe_path(settings.GRDOCS_PATH, filename)
+    _safe_path(settings.GRDOCS_PATH, filename)
 
-    if file_path.exists():
-        file_path.unlink()
-
-    result = await delete_gr_metadata(filename)
-
-    # Also remove any generated summary files for this GR —
-    # otherwise Summaries page keeps showing a summary for a GR that no longer exists
-    base_name = Path(filename).stem
-    for ext in ("_summary.json", "_summary.txt"):
-        # Derived names are validated too: base_name comes from the same
-        # untrusted input, so it gets the same containment check.
-        summary_file = _safe_path(settings.SUMMARIES_PATH, f"{base_name}{ext}")
-        if summary_file.exists():
-            summary_file.unlink()
-
-    return {
-        "success": True,
-        "message": f"File '{filename}' deleted.",
-    }
+    result = await purge_documents([filename])
+    return result

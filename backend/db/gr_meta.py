@@ -78,6 +78,32 @@ async def mark_as_embedded(filename: str) -> None:
     )
 
 
+async def mark_as_not_embedded(filename: str) -> None:
+    """
+    Clears the embedded flag on a GR record.
+
+    Used as a crash guard during deletion. The vectors are removed from
+    FAISS before the metadata record itself is deleted, and those are two
+    separate writes. If the process dies between them, this call has
+    already run, so the record left behind says "not embedded" — which is
+    the truth. Without it the survivor would claim embedded=True while
+    having no chunks in the index, and the Knowledge Base would show a
+    green "Embedded" badge for a document the retriever cannot see.
+
+    Args:
+        filename : the PDF filename to mark as no longer embedded
+    """
+    database = get_db()
+
+    await database.gr_metadata.update_one(
+        {"filename": filename},
+        {"$set": {
+            "embedded":    False,
+            "embedded_at": None,
+        }}
+    )
+
+
 async def get_all_gr_metadata() -> list:
     """
     Returns metadata for all uploaded GR documents.
