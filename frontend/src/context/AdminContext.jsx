@@ -42,12 +42,21 @@ export function AdminProvider({ children }) {
     } catch { /* silent — badge just won't show */ }
   }
 
+  // 60s, not 15s. This timer runs for the whole session on every admin
+  // page, so it is the only poller that hits the backend continuously —
+  // the embed and batch pollers only run while their job is active. At 15s
+  // it produced four access-log lines a minute forever, drowning the
+  // server terminal. The value it fetches is a badge count that changes
+  // only when a summary finishes, and the batch poller already refreshes
+  // that count on completion, so a slower tick loses nothing.
+  const PENDING_POLL_MS = 60000
+
   const startPendingPolling = () => {
     if (pendingPollRef.current) return
     pendingPollRef.current = setInterval(() => {
       // Skip while a batch job is running — batch polling already keeps count fresh then
       if (!batchRunningRef.current) loadPending()
-    }, 15000)
+    }, PENDING_POLL_MS)
   }
 
   const stopPendingPolling = () => {
@@ -80,9 +89,22 @@ export function AdminProvider({ children }) {
     if (batchPollRef.current) { clearInterval(batchPollRef.current); batchPollRef.current = null }
   }
 
-  const startBatchSummarize = async () => {
+  /**
+   * Starts batch summarization.
+   *
+   * @param {string[]|null} filenames  null/omitted → every pending document
+   *                                   (unchanged default). A list → only
+   *                                   those documents.
+   *
+   * The body is omitted entirely in the default case rather than sent as
+   * {filenames: null}, so the request stays byte-identical to what this
+   * function sent before selection existed.
+   */
+  const startBatchSummarize = async (filenames = null) => {
     try {
-      const res = await client.post('/summary/generate-batch')
+      const res = filenames?.length
+        ? await client.post('/summary/generate-batch', { filenames })
+        : await client.post('/summary/generate-batch')
       if (res.data.success) {
         setBatchState(res.data.state)
         startBatchPolling()

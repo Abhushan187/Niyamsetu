@@ -10,7 +10,8 @@ import CitationPill from '../components/CitationPill'
 export default function Chat() {
   const {
     messages, history, activeSessionId,
-    appendMessages, updateSessionTitle, createSession,
+    startExchange, completeExchange, failExchange,
+    updateSessionTitle, createSession,
     setActiveSessionId,
   } = useChat()
 
@@ -60,7 +61,10 @@ export default function Chat() {
     setGraphPanel(false)
 
     const userMsg = { role: 'user', content: query }
-    appendMessages(userMsg, { role: 'assistant', content: '...' })
+
+    // Writes the question plus ONE pending assistant bubble. Every exit
+    // path below replaces that same bubble — none of them append a second.
+    startExchange(userMsg)
 
     setLoading(true)
 
@@ -75,8 +79,8 @@ export default function Chat() {
         language:    language    || 'english',
       }
 
-      // Replace the placeholder "..." with real answer
-      appendMessages(userMsg, assistantMsg)
+      // Overwrites the pending bubble — it does not add one.
+      completeExchange(userMsg, assistantMsg)
 
       // Save to MongoDB session
       try {
@@ -91,7 +95,9 @@ export default function Chat() {
       if (citations?.length) fetchGraphRelations(citations)
 
     } catch (err) {
-      setError(err.response?.data?.detail || 'Something went wrong.')
+      // Turn the pending bubble into the error itself. Leaving it pending
+      // is what used to strand a placeholder on screen after a failure.
+      failExchange(err.response?.data?.detail || 'Something went wrong.')
     } finally {
       setLoading(false)
     }
@@ -107,11 +113,6 @@ export default function Chat() {
   ]
 
   const relationColor = { supersedes: '#EF4444', amends: '#FACC15', refers_to: '#6FB3FF' }
-
-  // Filter out the optimistic placeholder from display
-  const displayMessages = messages.filter(
-    (m, i) => !(m.role === 'assistant' && m.content === '...' && loading && i === messages.length - 1)
-  )
 
   return (
     <div style={{
@@ -166,7 +167,12 @@ export default function Chat() {
           )}
 
           {/* Message list */}
-          {displayMessages.map((msg, i) => (
+          {/*
+            Rendered straight from `messages` — no filtering. There is
+            exactly one entry per turn now, and the pending one renders as
+            the loading state below, so there is nothing to hide.
+          */}
+          {messages.map((msg, i) => (
             <div key={i}>
               {msg.role === 'user' ? (
                 <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -187,12 +193,20 @@ export default function Chat() {
                   }}>🏛️</div>
                   <div style={{ maxWidth: '75%' }}>
                     <div style={{
-                      background: '#1A1D2E', border: '1px solid #2A2D3E',
+                      background: '#1A1D2E',
+                      border: `1px solid ${msg.error ? '#EF4444' : '#2A2D3E'}`,
                       borderRadius: '4px 18px 18px 18px',
-                      padding: '14px 18px', color: '#E8EAF0',
-                      fontSize: '0.95rem', lineHeight: '1.65', whiteSpace: 'pre-wrap',
+                      padding: '14px 18px',
+                      color: msg.pending ? '#555' : (msg.error ? '#EF4444' : '#E8EAF0'),
+                      fontSize: msg.pending ? '0.88rem' : '0.95rem',
+                      lineHeight: '1.65', whiteSpace: 'pre-wrap',
                     }}>
-                      {msg.content}
+                      {/* Same bubble in all three states — the content is
+                          swapped, so the answer never stacks under a
+                          leftover loading bubble. */}
+                      {msg.pending
+                        ? 'Searching GR documents…'
+                        : (msg.error ? `❌ ${msg.content}` : msg.content)}
                     </div>
                     {msg.citations?.length > 0 && (
                       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
@@ -201,37 +215,27 @@ export default function Chat() {
                         ))}
                       </div>
                     )}
-                    <div style={{ color: '#444', fontSize: '0.72rem', marginTop: '6px', fontFamily: 'monospace' }}>
-                      ⏱ {msg.elapsed_sec}s
-                      {msg.language && (
-                        <span style={{ marginLeft: '8px' }}>
-                          · {msg.language === 'marathi' ? '🇮🇳 Marathi' : '🇬🇧 English'}
-                        </span>
-                      )}
-                    </div>
+                    {/* Timing only means something once an answer exists —
+                        it used to render "⏱ undefineds" on the placeholder. */}
+                    {!msg.pending && !msg.error && (
+                      <div style={{ color: '#444', fontSize: '0.72rem', marginTop: '6px', fontFamily: 'monospace' }}>
+                        ⏱ {msg.elapsed_sec}s
+                        {msg.language && (
+                          <span style={{ marginLeft: '8px' }}>
+                            · {msg.language === 'marathi' ? '🇮🇳 Marathi' : '🇬🇧 English'}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
             </div>
           ))}
 
-          {/* Loading */}
-          {loading && (
-            <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-              <div style={{
-                width: '36px', height: '36px', background: '#1E3A5F',
-                borderRadius: '50%', display: 'flex', alignItems: 'center',
-                justifyContent: 'center', fontSize: '1rem',
-              }}>🏛️</div>
-              <div style={{
-                background: '#1A1D2E', border: '1px solid #2A2D3E',
-                borderRadius: '4px 18px 18px 18px',
-                padding: '14px 18px', color: '#555', fontSize: '0.88rem',
-              }}>
-                Searching GR documents...
-              </div>
-            </div>
-          )}
+          {/* No separate loading bubble. It used to render alongside the
+              placeholder message, so a slow request showed two assistant
+              bubbles at once. The pending message IS the loading state. */}
 
           {error && (
             <div style={{

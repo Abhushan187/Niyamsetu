@@ -94,13 +94,85 @@ export function ChatProvider({ children }) {
     }
   }
 
-  const appendMessages = (userMsg, assistantMsg) => {
-    setMessages(prev => [...prev, userMsg, assistantMsg])
+  // ── One exchange = one user bubble + one assistant bubble ──────────
+  //
+  // This used to be a single append-only `appendMessages`, which Chat.jsx
+  // called twice per question: once with a "..." placeholder and again
+  // with the real answer. Appending cannot replace, so a finished exchange
+  // left FOUR entries — question, "...", question again, answer — and the
+  // stray "..." bubble rendered above the real one. The display filter
+  // that was supposed to hide it only matched while `loading` was true and
+  // only at the very last index, so it stopped matching the moment the
+  // answer arrived.
+  //
+  // Split into start/complete/fail so the placeholder is written once and
+  // then overwritten in place. There is no path that appends a second
+  // assistant bubble for the same question.
+
+  /** Index of the in-flight placeholder, or -1. */
+  const pendingIndex = (list) => {
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].role === 'assistant' && list[i].pending) return i
+    }
+    return -1
+  }
+
+  const replacePending = (list, message) => {
+    const i = pendingIndex(list)
+    // No placeholder to replace (an interrupted or already-resolved
+    // request) — append rather than clobbering an unrelated message.
+    if (i === -1) return [...list, message]
+    const next = [...list]
+    next[i] = message
+    return next
+  }
+
+  /**
+   * Adds the user's question plus the assistant placeholder that renders
+   * as the loading state.
+   *
+   * `history` is deliberately NOT touched here. It is the conversation
+   * context sent to the LLM, and a placeholder is not part of the
+   * conversation — the old code put "..." into it, so every later question
+   * carried a fake assistant turn saying "...".
+   */
+  const startExchange = (userMsg) => {
+    setMessages(prev => [
+      ...prev,
+      userMsg,
+      { role: 'assistant', content: '', pending: true },
+    ])
+  }
+
+  /**
+   * Swaps the placeholder for the real answer and commits the exchange to
+   * history — only now, once there is a genuine answer to record.
+   */
+  const completeExchange = (userMsg, assistantMsg) => {
+    setMessages(prev => replacePending(prev, assistantMsg))
     setHistory(prev => [
       ...prev,
       { role: 'user',      content: userMsg.content      },
       { role: 'assistant', content: assistantMsg.content },
     ])
+  }
+
+  /**
+   * Swaps the placeholder for an error bubble.
+   *
+   * History stays untouched: a failed request produced no assistant turn,
+   * and feeding the error text back as context would have the model
+   * answering about the error on the next question. This is also what
+   * clears the placeholder on failure — previously a failed request left
+   * "..." on screen permanently, which is the other way the stray bubble
+   * was seen.
+   */
+  const failExchange = (errorText) => {
+    setMessages(prev => replacePending(prev, {
+      role:    'assistant',
+      content: errorText,
+      error:   true,
+    }))
   }
 
   const updateSessionTitle = (sessionId, title) => {
@@ -113,7 +185,8 @@ export function ChatProvider({ children }) {
       sessionLoading, setMessages,
       loadSessions, createSession, loadSession,
       deleteSession, renameSession, pinSession,
-      appendMessages, updateSessionTitle,
+      startExchange, completeExchange, failExchange,
+      updateSessionTitle,
       setActiveSessionId,
     }}>
       {children}
