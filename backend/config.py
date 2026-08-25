@@ -70,6 +70,49 @@ class Settings(BaseSettings):
     # How many previous chat turns to include for context
     CONTEXT_WINDOW: int = 6
 
+    # ── CORS ──────────────────────────────────────────────
+    # Browser origins allowed to call this API, comma-separated.
+    #
+    # This replaces a hardcoded ["*"]. A wildcard here is dangerous
+    # specifically BECAUSE allow_credentials stays True: Starlette then
+    # reflects whatever Origin the caller sent back in the preflight
+    # response, so every cross-site preflight succeeds no matter who
+    # sent it. Today this app carries its JWT in an Authorization header
+    # from localStorage, which a browser will not attach cross-origin on
+    # its own — so the wildcard is not directly exploitable yet. It
+    # becomes exploitable the moment anything moves to a cookie, and it
+    # already lets any site read every unauthenticated endpoint.
+    #
+    # Default is the Vite dev server, named explicitly rather than "*".
+    # Note the dev frontend normally reaches the API through Vite's /api
+    # proxy, which is same-origin and never triggers CORS at all — so
+    # this default exists for direct calls (Swagger at /docs, a curl from
+    # a browser tab, a build served without the proxy).
+    #
+    # Deployments set their real front-end origin, e.g.
+    #     CORS_ALLOWED_ORIGINS=https://niyamsetu.example.gov.in
+    # Multiple origins are comma-separated. Do not put "*" here.
+    CORS_ALLOWED_ORIGINS: str = "http://localhost:5173"
+
+    # ── Default user seeding ──────────────────────────────
+    # Whether seed_default_users() is allowed to run at startup.
+    #
+    # That function creates admin/admin123 and user1/user123 when the users
+    # collection is empty. Both are written in the source, so anyone who
+    # reads the repository knows the credentials of any deployment that
+    # started from an empty database — a public demo, a fresh staging box,
+    # or a reviewer's clone.
+    #
+    # Defaults to True so a developer who has never heard of this setting
+    # gets exactly the behaviour that existed before it: clone, run, log in.
+    # Any deployment that is not someone's laptop should set
+    #     SEED_DEFAULT_USERS=false
+    # in its .env, create a real admin account, and never rely on the seeds.
+    #
+    # Turning it off does NOT remove accounts that were already seeded — it
+    # only stops new ones being created.
+    SEED_DEFAULT_USERS: bool = True
+
     # ── Local file storage ────────────────────────────────
     # Base data directory — relative to backend/ folder
     DATA_DIR: str = "./data"
@@ -77,6 +120,20 @@ class Settings(BaseSettings):
     # ── Computed paths (derived from DATA_DIR) ────────────
     # These are properties, not .env variables
     # They give you Path objects you can use directly in code
+    @property
+    def CORS_ORIGINS(self) -> list[str]:
+        """
+        CORS_ALLOWED_ORIGINS split into the list CORSMiddleware wants.
+
+        Kept as a comma-separated string in .env rather than a typed
+        list: pydantic parses a list-typed setting as JSON, which would
+        make the .env line ["https://a","https://b"] instead of plain
+        text, and get quietly rejected when someone writes it the
+        obvious way. Blank entries are dropped so a trailing comma is
+        harmless.
+        """
+        return [o.strip() for o in self.CORS_ALLOWED_ORIGINS.split(",") if o.strip()]
+
     @property
     def GRDOCS_PATH(self) -> Path:
         # Where uploaded GR PDFs are stored

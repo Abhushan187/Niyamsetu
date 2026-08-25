@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from config import settings
 from db.mongo import connect_db, close_db
 from db.users import seed_default_users
 
@@ -52,11 +53,13 @@ app = FastAPI(
 # to another origin (localhost:8000 FastAPI) by default.
 # This middleware tells the browser: "it's okay, allow these origins."
 #
-# In production you would replace "*" with your actual domain.
-# For local development allowing all origins is fine.
+# The allowed origins come from CORS_ALLOWED_ORIGINS in .env — see that
+# setting in config.py. It is an explicit list, never "*", because
+# allow_credentials below is True and the two together tell Starlette to
+# reflect any caller's Origin back as allowed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # allow all origins in development
+    allow_origins=settings.CORS_ORIGINS,   # explicit list from .env, never "*"
     allow_credentials=True,       # allow cookies and auth headers
     allow_methods=["*"],          # allow GET, POST, DELETE, etc.
     allow_headers=["*"],          # allow Authorization header etc.
