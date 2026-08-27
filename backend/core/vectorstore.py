@@ -222,9 +222,26 @@ def clear_cache():
     Clears the in-memory cache.
     Called after embed_all_pdfs() so the next query
     loads the fresh index instead of the old cached one.
+
+    Also drops the BM25 index that core.hybrid_search caches over the
+    same corpus. That cache keys itself on (id(store), ntotal), which
+    self-invalidates in the common case because a reloaded store is a new
+    object — but id() is a memory address CPython is free to REUSE once
+    the old store is collected. A rebuild landing at the same address
+    with an unchanged chunk count would then serve BM25 scores computed
+    over the previous corpus, silently and with no error. Now that hybrid
+    retrieval is the live query path, invalidate it explicitly here
+    instead of relying on that.
+
+    Imported inside the function, not at module scope: core.hybrid_search
+    imports load_store from THIS module, so a top-level import back would
+    be a circular import at startup.
     """
     global _vector_store
     _vector_store = None
+
+    from core.hybrid_search import clear_lexical_cache
+    clear_lexical_cache()
 
 
 # ── Index maintenance ─────────────────────────────────────
