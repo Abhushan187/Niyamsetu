@@ -25,7 +25,7 @@ from langchain_core.messages import HumanMessage
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import settings
-from core.vectorstore import search
+from core.hybrid_search import hybrid_search
 from core.language import detect_language, format_chat_history, clean_text
 from core.trace import trace
 
@@ -79,7 +79,7 @@ def build_citations(docs: list) -> list:
     Deduplicates — same file+page combination appears only once.
 
     Args:
-        docs : list of LangChain Document objects from FAISS search
+        docs : list of LangChain Document objects from retrieval
 
     Returns:
         List of citation dicts:
@@ -225,13 +225,26 @@ async def query(
     if language is None:
         language = detect_language(user_query)
 
-    # ── Step 2: Search FAISS ──────────────────────────────
-    # search() is synchronous: on the first call it loads the FAISS index
-    # from disk, and every call embeds the query via a blocking Ollama HTTP
-    # request (measured ~8s cold, ~0.3s warm). Both stall the event loop.
-    # Offloaded to a worker thread — retrieval behaviour is unchanged.
-    trace("RETRIEVAL start", f"top_k={top_k} language={language}")
-    docs = await asyncio.to_thread(search, user_query, top_k=top_k)
+    # ── Step 2: Retrieve (hybrid: dense + BM25, fused by RRF) ──
+    # hybrid_search() runs FAISS and BM25 independently over the same
+    # corpus and fuses the two rankings. It returns list[Document], the
+    # identical shape vectorstore.search() returned, so Steps 3-4 below
+    # are untouched — only the ORDER and membership of the chunks change.
+    #
+    # Still synchronous, and for the same reasons as before: the first
+    # call loads the FAISS index from disk and builds the BM25 index, and
+    # every call embeds the query via a blocking Ollama HTTP request
+    # (~8s cold, ~0.3s warm). The added BM25 half needs no embedding call
+    # and is CPU-only. All of it stalls the event loop, so it stays on a
+    # worker thread exactly as search() did.
+    #
+    # Degrades rather than fails: if the dense side errors, hybrid_search
+    # returns the lexical ranking alone instead of raising, so a
+    # momentarily unreachable Ollama downgrades retrieval quality rather
+    # than breaking the chat. Empty list still means "store not ready",
+    # which the guard below handles unchanged.
+    trace("RETRIEVAL start", f"top_k={top_k} language={language} mode=hybrid")
+    docs = await asyncio.to_thread(hybrid_search, user_query, top_k=top_k)
     retrieval_sec = round(time.time() - start_time, 2)
     trace("RETRIEVAL done ", f"{len(docs)} chunk(s) in {retrieval_sec}s")
 
