@@ -20,10 +20,14 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import dotenv_values
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import settings
+from rate_limit import limiter
 from db.mongo import connect_db, close_db
 from db.users import seed_default_users
 
@@ -80,6 +84,27 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── Rate limiting (slowapi) ───────────────────────────────
+# Only the login route is decorated; see auth/router.py.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+def _cors_origins() -> list[str]:
+    """
+    Allowed origins from CORS_ORIGINS (comma separated). Read from the
+    process environment first, then from backend/.env. When unset, fall
+    back to the origins allowed before (settings.CORS_ORIGINS, which comes
+    from CORS_ALLOWED_ORIGINS, default http://localhost:5173).
+    """
+    raw = os.environ.get("CORS_ORIGINS")
+    if raw is None:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        raw = dotenv_values(env_path).get("CORS_ORIGINS")
+    if raw is None:
+        return settings.CORS_ORIGINS
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
 # ── CORS Middleware ───────────────────────────────────────
 # CORS = Cross-Origin Resource Sharing
 # Browsers block requests from one origin (localhost:5173 React)
@@ -92,7 +117,7 @@ app = FastAPI(
 # reflect any caller's Origin back as allowed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,   # explicit list from .env, never "*"
+    allow_origins=_cors_origins(),   # explicit list from CORS_ORIGINS, never "*"
     allow_credentials=True,       # allow cookies and auth headers
     allow_methods=["*"],          # allow GET, POST, DELETE, etc.
     allow_headers=["*"],          # allow Authorization header etc.
@@ -127,3 +152,9 @@ async def root():
         "status":  "running",
         "docs":    "http://localhost:8000/docs",
     }
+
+
+@app.get("/health")
+async def health():
+    """Unauthenticated liveness check for the frontend. No DB access."""
+    return {"ok": True}

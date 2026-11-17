@@ -7,6 +7,7 @@ numpy==2.1.0
 # ── Web framework ─────────────────────────────────────────
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+slowapi==0.1.9            # rate limit on POST /api/auth/login
 
 # ── Authentication ────────────────────────────────────────
 python-jose[cryptography]==3.3.0

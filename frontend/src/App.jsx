@@ -17,7 +17,9 @@
 //   *                 → anything else redirects to /login
 // ─────────────────────────────────────────────────────────
 
+import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { backendUp } from './apiBase'
 import { AuthProvider } from './context/AuthContext'
 import ProtectedRoute from './components/ProtectedRoute'
 import AdminRoute from './components/AdminRoute'
@@ -36,9 +38,32 @@ import Analytics from './pages/Analytics'
 import KnowledgeBase from './pages/KnowledgeBase'
 
 export default function App() {
+  // Backend reachability, checked on mount and every 20 seconds.
+  // Starts true so the banner does not flash before the first check.
+  const [online, setOnline] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    const check = async () => {
+      const up = await backendUp()
+      if (!cancelled) setOnline(up)
+    }
+    check()
+    const id = setInterval(check, 20000)
+    return () => {
+      cancelled = true
+      clearInterval(id)
+    }
+  }, [])
+
   return (
     // BrowserRouter enables URL-based navigation
     <BrowserRouter>
+      {!online && (
+        <div className="fixed top-0 inset-x-0 z-50 bg-red-600 text-white text-center text-sm py-2 px-4 pointer-events-none">
+          The server is offline. Please try again later.
+        </div>
+      )}
       {/* AuthProvider wraps everything so all pages can useAuth() */}
       <AuthProvider>
         <Routes>

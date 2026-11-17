@@ -16,7 +16,7 @@
 import sys
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -29,6 +29,7 @@ from auth.models import (
 )
 from auth.jwt_handler import create_token, verify_token
 from db.users import authenticate_user, create_user, delete_user, list_all_users
+from rate_limit import limiter
 
 # ── Router setup ──────────────────────────────────────────
 # prefix means all routes here start with /api/auth
@@ -86,7 +87,8 @@ async def get_admin_user(
 # ── Routes ────────────────────────────────────────────────
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+@limiter.limit("5/minute")
+async def login(request: Request, credentials: LoginRequest):
     """
     Login endpoint — validates credentials and returns JWT token.
 
@@ -101,7 +103,7 @@ async def login(request: LoginRequest):
         Authorization: Bearer <token>
     """
     # Authenticate against MongoDB
-    user = await authenticate_user(request.username, request.password)
+    user = await authenticate_user(credentials.username, credentials.password)
 
     if not user:
         # Use 401 not 404 — don't reveal whether username exists

@@ -9,6 +9,7 @@
 // ─────────────────────────────────────────────────────────
 
 import axios from 'axios'
+import { apiUrl } from '../apiBase'
 
 // Create axios instance pointing to our FastAPI backend
 // The proxy in vite.config.js forwards /api calls to localhost:8000
@@ -26,6 +27,9 @@ const client = axios.create({
 // you never manually add the token in individual API calls.
 client.interceptors.request.use(
   (config) => {
+    // Backend address is resolved at runtime (see apiBase.js). With an
+    // empty base this stays '/api', which the Vite dev proxy handles.
+    config.baseURL = apiUrl('') + '/api'
     const token = localStorage.getItem('niyamsetu_token')
     if (token) {
       // Bearer token format required by FastAPI OAuth2
